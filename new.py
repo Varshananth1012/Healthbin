@@ -7,10 +7,31 @@ import cv2
 import matplotlib.pyplot as plt
 from scipy.signal import detrend, butter, filtfilt
 import tensorflow.lite as tflite
+import sqlite3
+import pandas as pd
+import requests
 
-st.set_page_config(page_title="Health Monitor", layout="wide")
+# App Config
+st.set_page_config(page_title="OxyPulse", layout="wide")
 
-# Sidebar Profile Creation
+# DB Setup
+conn = sqlite3.connect("oxypulse.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS predictions (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        email TEXT,
+        date TEXT,
+        systolic REAL,
+        diastolic REAL,
+        heart_rate REAL,
+        spo2 REAL
+    )
+''')
+conn.commit()
+
+# Sidebar Profile
 st.sidebar.header("👤 Create Your Profile")
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = {}
@@ -31,11 +52,11 @@ with st.sidebar.form("profile_form"):
         }
         st.success(f"Profile saved for {name}!")
 
-# Display user profile
+# Show profile
 if st.session_state.user_profile:
     profile = st.session_state.user_profile
     st.markdown(f"""
-        <div style="padding:10px; border-radius:10px; background-color:#f3f4f6; color:#111; margin-bottom:10px;">
+        <div style="padding:10px; border-radius:10px; background:linear-gradient(to right, #fff1eb, #ace0f9); color:#000;">
         <h4>👤 User Profile</h4>
         <p><strong>Name:</strong> {profile['name']}</p>
         <p><strong>Age:</strong> {profile['age']}</p>
@@ -43,53 +64,51 @@ if st.session_state.user_profile:
         <p><strong>Email:</strong> {profile['email']}</p>
         </div>
     """, unsafe_allow_html=True)
-else:
-    st.warning("Please create your profile in the sidebar before uploading a video.")
 
-# App Title
-st.title("HEALTHBIN (BP, HR, SpO₂)")
-st.caption("Your personal health monitor (BP, HR, SpO₂)")
-st.write("Upload a fingertip video to analyze vital signs using PPG signals.")
+# Upload
+st.title("OxyPulse (BP, HR, SpO₂)")
+video_file = st.file_uploader("Upload a fingertip video", type=["mp4", "avi", "mov"])
 
-# Upload video
-video_file = st.file_uploader("Upload a video file", type=["mp4", "avi", "mov"])
-
-# Preprocess function
 def preprocess_ppg(ppg_signal, fs=30):
     ppg_signal = detrend(ppg_signal)
     b, a = butter(3, [0.7 / (0.5 * fs), 4 / (0.5 * fs)], btype='band')
     return filtfilt(b, a, ppg_signal)
 
-# Model inference function
 def run_model(tflite_path, ppg_signal, multi_output=False):
     interpreter = tflite.Interpreter(model_path=tflite_path)
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
-    expected_shape = input_details[0]['shape']
-    resized = np.resize(ppg_signal, (expected_shape[1], 1)).astype(np.float32)
+    resized = np.resize(ppg_signal, (input_details[0]['shape'][1], 1)).astype(np.float32)
     resized = np.expand_dims(resized, axis=0)
-
     interpreter.set_tensor(input_details[0]['index'], resized)
     interpreter.invoke()
     output = interpreter.get_tensor(output_details[0]['index'])[0]
-
     return output if multi_output else output[0]
 
-# Main logic
+def download_model_if_not_exists(url, local_path):
+    if not os.path.exists(local_path):
+        st.info(f"Downloading model from {url}...")
+        response = requests.get(url)
+        if response.status_code == 200:
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+            st.success(f"Model saved to {local_path}")
+        else:
+            st.error(f"Failed to download model from {url}")
+
+# Main
 if video_file:
     with tempfile.TemporaryDirectory() as temp_dir:
         video_path = os.path.join(temp_dir, "uploaded_video.mp4")
         with open(video_path, "wb") as f:
             f.write(video_file.read())
 
-        # Extract frames
         cap = cv2.VideoCapture(video_path)
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         frame_interval = int(fps * 0.5)
-        frames = []
-        frame_count = 0
+        frames, frame_count = [], 0
 
         while True:
             ret, frame = cap.read()
@@ -101,77 +120,94 @@ if video_file:
             frame_count += 1
         cap.release()
 
-        if len(frames) < 1:
-            st.error("No frames were extracted from the video.")
+        if not frames:
+            st.error("No frames extracted.")
             st.stop()
 
-        # Stack image and extract PPG
         stacked_image = np.mean(frames, axis=0).astype(np.uint8)
-        st.image(stacked_image, caption="Stacked Image (RGB Average)")
+        st.image(stacked_image, caption="Stacked Image")
 
         r, g, b = cv2.split(stacked_image)
         ppg_signal = (np.mean(r, axis=1) + np.mean(g, axis=1) + np.mean(b, axis=1)) / 3
         ppg_signal = preprocess_ppg(ppg_signal)
         ppg_signal = (ppg_signal - np.min(ppg_signal)) / (np.max(ppg_signal) - np.min(ppg_signal))
-        time_axis = np.arange(len(ppg_signal))
 
-        st.subheader("📈 Extracted PPG Signal")
         fig, ax = plt.subplots()
-        ax.plot(time_axis, ppg_signal, color="black")
-        ax.set_xlabel("Time (rows)")
-        ax.set_ylabel("Normalized Intensity")
-        ax.set_title("PPG Signal")
+        ax.plot(np.arange(len(ppg_signal)), ppg_signal, color="black")
+        ax.set_title("Extracted PPG Signal")
         ax.grid()
         st.pyplot(fig)
 
-        # Load embedded models
-        st.subheader("🧠 Model Predictions")
+        # Model paths
         model_dir = "models"
-        bp_model_path = os.path.join(model_dir, "C:/Users/varsh/OneDrive/Desktop/new project/bp_model.tflite")
-        hr_model_path = os.path.join(model_dir, "C:/Users/varsh/OneDrive/Desktop/new project/heart_rate_model.tflite")
-        spo2_model_path = os.path.join(model_dir, "C:/Users/varsh/OneDrive/Desktop/new project/spo2_model.tflite")
+        os.makedirs(model_dir, exist_ok=True)
 
+        # GitHub raw links (Replace with your actual raw links)
+        bp_url = "https://raw.githubusercontent.com/Varshananth1012/Healthbin/main/models/bp_model.tflite"
+        hr_url = "https://raw.githubusercontent.com/Varshananth1012/Healthbin/main/models/hr_model.tflite"
+        spo2_url = "https://raw.githubusercontent.com/Varshananth1012/Healthbin/main/models/spo2_model.tflite"
+
+        # Local paths
+        bp_model_path = os.path.join(model_dir, "bp_model.tflite")
+        hr_model_path = os.path.join(model_dir, "hr_model.tflite")
+        spo2_model_path = os.path.join(model_dir, "spo2_model.tflite")
+
+        # Download models
+        download_model_if_not_exists(bp_url, bp_model_path)
+        download_model_if_not_exists(hr_url, hr_model_path)
+        download_model_if_not_exists(spo2_url, spo2_model_path)
+
+        # Predictions
         if os.path.exists(bp_model_path) and os.path.exists(hr_model_path) and os.path.exists(spo2_model_path):
             systolic, diastolic = run_model(bp_model_path, ppg_signal, multi_output=True)
             hr_value = run_model(hr_model_path, ppg_signal)
             spo2_value = run_model(spo2_model_path, ppg_signal)
 
-            # Display results in colorful cards
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown(f'''<div class="card"><h3>💧 Systolic</h3><p>{systolic:.2f} mmHg</p></div>''', unsafe_allow_html=True)
-            with col2:
-                st.markdown(f'''<div class="card"><h3>💧 Diastolic</h3><p>{diastolic:.2f} mmHg</p></div>''', unsafe_allow_html=True)
-            with col3:
-                st.markdown(f'''<div class="card"><h3>❤️ Heart Rate</h3><p>{hr_value:.2f} bpm</p></div>''', unsafe_allow_html=True)
+            st.subheader("🧠 Model Predictions")
+            st.write(f"💧 **Systolic:** {systolic:.2f} mmHg")
+            st.write(f"💧 **Diastolic:** {diastolic:.2f} mmHg")
+            st.write(f"❤️ **Heart Rate:** {hr_value:.2f} bpm")
+            st.write(f"🧪 **SpO₂:** {spo2_value:.2f} %")
 
-            st.markdown(f'''<div class="card"><h3>🧪 SpO₂</h3><p>{spo2_value:.2f} %</p></div>''', unsafe_allow_html=True)
+            # Save to DB
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute('''
+                INSERT INTO predictions (name, email, date, systolic, diastolic, heart_rate, spo2)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (profile['name'], profile['email'], now, systolic, diastolic, hr_value, spo2_value))
+            conn.commit()
         else:
-            st.error("One or more embedded models are missing. Please ensure bp_model.tflite, hr_model.tflite, and spo2_model.tflite are in the 'models/' directory.")
+            st.error("Model files not found.")
 
-# Custom CSS Styling
+# Show History
+if st.session_state.user_profile:
+    st.subheader("📊 Prediction History")
+    user_email = st.session_state.user_profile['email']
+    cursor.execute("SELECT date, systolic, diastolic, heart_rate, spo2 FROM predictions WHERE email = ? ORDER BY date DESC", (user_email,))
+    data = cursor.fetchall()
+    df = pd.DataFrame(data, columns=["Date", "Systolic", "Diastolic", "Heart Rate", "SpO₂"])
+    st.dataframe(df)
+
+    if not df.empty:
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download CSV Report", data=csv, file_name="oxypulse_predictions.csv", mime="text/csv")
+
+# Style
 st.markdown("""
     <style>
     .stApp {
-        background-color: #111827;
+        background: linear-gradient(to right, #fdfbfb, #ebedee);
+        color: black;
+    }
+    .css-1cpxqw2 {
+        background-color: white;
+    }
+    .css-18e3th9 {
+        padding-top: 2rem;
+    }
+    .stButton>button {
+        background-color: #00b4d8;
         color: white;
-    }
-    .card {
-        background-color: #fef3c7;
-        border-radius: 20px;
-        padding: 20px;
-        text-align: center;
-        box-shadow: 0px 4px 15px rgba(0,0,0,0.2);
-        margin-bottom: 20px;
-        color: black;
-    }
-    .card h3 {
-        font-weight: bold;
-        color: black;
-    }
-    .card p {
-        color: black;
-        font-size: 22px;
         font-weight: bold;
     }
     </style>
